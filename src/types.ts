@@ -35,6 +35,17 @@ export interface Config {
   toolCallTimeoutMs?: number
   maxBodyBytes?: number
   maxResultMetaBytes?: number
+  prompts?: {
+    /**
+     * Trusted MCP prompts injected into every Harness Agent system prompt.
+     * Nothing is injected unless explicitly allowlisted here.
+     */
+    autoInject?: Array<{
+      serverName: string
+      name: string
+      arguments?: Record<string, string>
+    }>
+  }
 }
 
 /** Canonical MCP result retained for the View but rendered as text for the model. */

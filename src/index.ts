@@ -13,7 +13,7 @@ export const name = 'mcp-apps'
 export const MCP_APPS_SPEC_VERSION = '2026-01-26'
 
 /** Required Harness services. */
-export const inject = ['tools', 'webServer']
+export const inject = ['tools', 'webServer', 'systemPrompt']
 
 /** Mount MCP connections, tool registrations, Host API, and the isolated Sandbox Proxy. */
 export async function apply(ctx: Context, config?: Config): Promise<void> {

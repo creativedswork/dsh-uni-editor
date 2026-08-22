@@ -41,6 +41,12 @@ The bundle is activated automatically. Configure its `mcp-apps` row in `$DSH_HOM
         args: [/absolute/path/to/server.js]
         cwd: /absolute/path/to/server
         forwardWorkspace: true
+    prompts:
+      autoInject:
+        - serverName: counter
+          name: test-review-loop
+          arguments:
+            threshold: '85'
 ```
 
 `forwardWorkspace` is disabled by default. Enable it only for a trusted local
@@ -49,6 +55,15 @@ streamable-http` never receives Workspace metadata and accepts `url` and
 optional `headers` instead of `command`, `args`, `cwd`, and `env`.
 `serverName` must match `[A-Za-z0-9_-]{1,32}` and becomes part of the public
 tool name.
+
+`prompts.autoInject` is an explicit trust allowlist. For each listed prompt,
+the Host calls MCP `prompts/list` and `prompts/get`, then contributes the
+returned guidance to the Harness system prompt. This lets the Agent apply an
+MCP-provided workflow during ordinary turns without a Slash Command. Only
+user-role text and embedded text resources are accepted. The prompt is
+removed when its Server disconnects and refreshed after
+`notifications/prompts/list_changed`. Do not allowlist prompts from an
+untrusted Server: their content receives system-prompt authority.
 
 Start Harness with:
 
@@ -84,6 +99,8 @@ For the full editor example, install and configure [`threejs-editor-mcp`](https:
 
 - Targets MCP Apps specification `2026-01-26` and advertises `text/html;profile=mcp-app`.
 - Supports stdio and Streamable HTTP MCP transports.
+- Injects only explicitly allowlisted MCP Prompts, with source provenance, into
+  the Harness system prompt.
 - Applies `_meta.ui.visibility`; omitted visibility means model and app.
 - For trusted local stdio Servers with `forwardWorkspace: true`, adds the
   calling Agent's immutable workspace `cwd` to model-originated `tools/call`

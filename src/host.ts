@@ -5,9 +5,11 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import {
   CallToolResultSchema,
+  PromptListChangedNotificationSchema,
   ReadResourceResultSchema,
   ToolListChangedNotificationSchema,
   type CallToolResult,
+  type Prompt,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js'
 import {
@@ -20,6 +22,8 @@ import type {
   ToolExecution,
 } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/dsh-system-prompt'
+import { renderInjectedPrompt } from './prompt-injection.js'
 import { normalizeCsp, startSandboxServer } from './sandbox.js'
 import type {
   Config,
@@ -46,7 +50,10 @@ interface ResolvedConfig {
   toolCallTimeoutMs: number
   maxBodyBytes: number
   maxResultMetaBytes: number
+  promptInjections: PromptInjection[]
 }
+
+type PromptInjection = NonNullable<NonNullable<Config['prompts']>['autoInject']>[number]
 
 interface Visibility {
   app: boolean
@@ -88,6 +95,35 @@ function resolveConfig(config: Config | undefined): ResolvedConfig {
       }
     }
   }
+  const promptInjections = config?.prompts?.autoInject ?? []
+  const promptKeys = new Set<string>()
+  for (const injection of promptInjections) {
+    if (typeof injection.serverName !== 'string' || typeof injection.name !== 'string') {
+      throw new Error('mcp-apps: auto-injected prompt serverName and name must be strings')
+    }
+    if (!names.has(injection.serverName)) {
+      throw new Error(`mcp-apps: auto-injected prompt references unknown server ${JSON.stringify(injection.serverName)}`)
+    }
+    if (injection.name === '' || injection.name.length > 128) {
+      throw new Error('mcp-apps: auto-injected prompt name must contain 1-128 characters')
+    }
+    const key = `${injection.serverName}\0${injection.name}`
+    if (promptKeys.has(key)) {
+      throw new Error(`mcp-apps: duplicate auto-injected prompt ${JSON.stringify(injection.name)}`)
+    }
+    promptKeys.add(key)
+    if (injection.arguments !== undefined
+      && (injection.arguments === null
+        || typeof injection.arguments !== 'object'
+        || Array.isArray(injection.arguments))) {
+      throw new Error('mcp-apps: auto-injected prompt arguments must be an object')
+    }
+    for (const [name, value] of Object.entries(injection.arguments ?? {})) {
+      if (name === '' || typeof value !== 'string') {
+        throw new Error('mcp-apps: auto-injected prompt arguments must be named strings')
+      }
+    }
+  }
   return {
     servers,
     toolCallTimeoutMs: positiveInteger(config?.toolCallTimeoutMs, DEFAULT_TOOL_TIMEOUT_MS, 'toolCallTimeoutMs'),
@@ -97,6 +133,7 @@ function resolveConfig(config: Config | undefined): ResolvedConfig {
       DEFAULT_MAX_RESULT_META_BYTES,
       'maxResultMetaBytes',
     ),
+    promptInjections,
   }
 }
 
@@ -176,6 +213,7 @@ class ServerState {
   readonly client: Client
   readonly tools = new Map<string, { tool: Tool; visibility: Visibility }>()
   private toolDisposers = new Map<string, () => void>()
+  private promptDisposers: Array<() => void> = []
   private viewIds = new Set<string>()
 
   constructor(
@@ -206,11 +244,19 @@ class ServerState {
         this.ctx.logger.error(`mcp-apps(${this.config.serverName}): tool re-sync failed: ${String(error)}`)
       }
     })
+    this.client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
+      try {
+        await this.syncPrompts()
+      } catch (error) {
+        this.ctx.logger.error(`mcp-apps(${this.config.serverName}): prompt re-sync failed: ${String(error)}`)
+      }
+    })
     await this.client.connect(createTransport(this.config))
-    await this.sync()
+    await Promise.all([this.sync(), this.syncPrompts()])
   }
 
   private async listTools(): Promise<Tool[]> {
+    if (this.client.getServerCapabilities()?.tools === undefined) return []
     const tools: Tool[] = []
     let cursor: string | undefined
     do {
@@ -219,6 +265,57 @@ class ServerState {
       cursor = page.nextCursor
     } while (cursor !== undefined)
     return tools
+  }
+
+  private async listPrompts(): Promise<Prompt[]> {
+    if (this.client.getServerCapabilities()?.prompts === undefined) return []
+    const prompts: Prompt[] = []
+    let cursor: string | undefined
+    do {
+      const page = await this.client.listPrompts(cursor === undefined ? {} : { cursor })
+      prompts.push(...page.prompts)
+      cursor = page.nextCursor
+    } while (cursor !== undefined)
+    return prompts
+  }
+
+  private async syncPrompts(): Promise<void> {
+    const injections = this.resolved.promptInjections
+      .filter(injection => injection.serverName === this.config.serverName)
+    if (injections.length === 0) return
+    if (this.client.getServerCapabilities()?.prompts === undefined) {
+      throw new Error(`mcp-apps(${this.config.serverName}): configured autoInject prompts but server has no prompts capability`)
+    }
+    const available = new Set((await this.listPrompts()).map(prompt => prompt.name))
+    const sections = await Promise.all(injections.map(async (injection) => {
+      if (!available.has(injection.name)) {
+        throw new Error(
+          `mcp-apps(${this.config.serverName}): auto-injected prompt ${JSON.stringify(injection.name)} is unavailable`,
+        )
+      }
+      const result = await this.client.getPrompt(
+        {
+          name: injection.name,
+          ...injection.arguments === undefined ? {} : { arguments: injection.arguments },
+        },
+        { timeout: this.resolved.toolCallTimeoutMs },
+      )
+      return {
+        name: `mcp-prompt:${this.config.serverName}:${injection.name}`,
+        order: 130,
+        text: renderInjectedPrompt(this.config.serverName, injection.name, result),
+      }
+    }))
+    for (const dispose of this.promptDisposers) dispose()
+    this.promptDisposers = []
+    const nextDisposers: Array<() => void> = []
+    try {
+      for (const section of sections) nextDisposers.push(this.ctx.systemPrompt.section(section))
+      this.promptDisposers = nextDisposers
+    } catch (error) {
+      for (const dispose of nextDisposers) dispose()
+      throw error
+    }
   }
 
   private output(rawName: string, view: McpAppCatalogItem | undefined): ToolDefinition['output'] {
@@ -375,6 +472,8 @@ class ServerState {
   async dispose(): Promise<void> {
     for (const dispose of this.toolDisposers.values()) dispose()
     this.toolDisposers.clear()
+    for (const dispose of this.promptDisposers) dispose()
+    this.promptDisposers = []
     this.host.removeViews(this.viewIds)
     this.viewIds.clear()
     await this.client.close()

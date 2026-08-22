@@ -7,6 +7,14 @@ import { Context } from '@deepseek-ai/cordis'
 const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
 const plugin = await import('../lib/index.js')
 
+function provideSystemPrompt(ctx) {
+  ctx.provide('systemPrompt', {
+    section() {
+      return () => {}
+    },
+  })
+}
+
 test('publishes one installable DSH bundle', async () => {
   assert.equal(manifest.name, '@creative-dswork/dsh-uni-editor')
   assert.equal(manifest.publishConfig.access, 'public')
@@ -58,6 +66,7 @@ test('rejects CSP injection and normalizes safe origins', () => {
 test('passes the calling DSH workspace to model MCP tool requests', async () => {
   const ctx = new Context()
   const definitions = new Map()
+  provideSystemPrompt(ctx)
   ctx.provide('tools', {
     register(definition) {
       definitions.set(definition.name, definition)
@@ -88,7 +97,7 @@ test('passes the calling DSH workspace to model MCP tool requests', async () => 
           args: [new URL('./fixtures/workspace-context-server.mjs', import.meta.url).pathname],
         },
       ],
-    })
+    }).await()
     const definition = definitions.get(plugin.publicToolName('context', 'show_context'))
     const signal = new AbortController().signal
     const cwd = '/tmp/selected-threejs-game'
@@ -114,6 +123,7 @@ test('hosts the counter MCP App and keeps app-only tools out of the model regist
   const ctx = new Context()
   const definitions = new Map()
   let route
+  provideSystemPrompt(ctx)
   ctx.provide('tools', {
     register(definition) {
       definitions.set(definition.name, definition)
@@ -137,7 +147,7 @@ test('hosts the counter MCP App and keeps app-only tools out of the model regist
         command: process.execPath,
         args: [new URL('../demo/dist/server.js', import.meta.url).pathname],
       }],
-    })
+    }).await()
 
     const showName = plugin.publicToolName('counter', 'show_counter')
     const incrementName = plugin.publicToolName('counter', 'increment_counter')

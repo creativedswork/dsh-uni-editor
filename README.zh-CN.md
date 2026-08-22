@@ -41,12 +41,26 @@ dsh plugin --profile web add @creative-dswork/dsh-uni-editor
         args: [/absolute/path/to/server.js]
         cwd: /absolute/path/to/server
         forwardWorkspace: true
+    prompts:
+      autoInject:
+        - serverName: counter
+          name: test-review-loop
+          arguments:
+            threshold: '85'
 ```
 
 `forwardWorkspace` 默认关闭，只应对需要当前 DSH Workspace 的可信本地 stdio
 Server 启用。`transport: streamable-http` 不会收到 Workspace metadata；此时改为
 提供 `url` 和可选的 `headers`，不再填写 `command`、`args`、`cwd` 和 `env`。
 `serverName` 必须匹配 `[A-Za-z0-9_-]{1,32}`，它会成为公开工具名的一部分。
+
+`prompts.autoInject` 是显式信任白名单。Host 会对每个配置项调用 MCP
+`prompts/list` 和 `prompts/get`，再将返回的指导内容加入 Harness system
+prompt。这样 Agent 可以在普通 Turn 中主动采用 MCP 提供的工作流，不需要
+Slash Command。当前只接受 user-role 文本和内嵌文本资源；Server 断开时会
+移除对应 Prompt，收到 `notifications/prompts/list_changed` 后会重新加载。
+不要将不可信 Server 的 Prompt 加入白名单，因为这些内容会获得 system
+prompt 权限。
 
 启动 Harness：
 
@@ -82,6 +96,7 @@ pnpm dlx @deepseek-ai/dsh@0.1.0-rc.6 web --patch "$PWD/demo/cordis.patch.yml"
 
 - 目标规范为 MCP Apps `2026-01-26`，View MIME 类型为 `text/html;profile=mcp-app`。
 - 支持 stdio 和 Streamable HTTP 两种 MCP transport。
+- 只将明确加入白名单的 MCP Prompt 注入 Harness system prompt，并标注来源。
 - 识别 `_meta.ui.visibility`；省略该字段时，工具同时对模型和 App 可见。
 - 对设置 `forwardWorkspace: true` 的可信本地 stdio Server，将调用 Agent
   不可变的 Workspace `cwd` 写入模型发起的 `tools/call` request metadata
