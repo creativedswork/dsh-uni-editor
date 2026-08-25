@@ -10,6 +10,7 @@ import type { CSSProperties, KeyboardEvent } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { appRegistry } from './app-registry.js'
+import { suspendAppRuntimeInteractions } from './frame-placement.js'
 
 type ActiveAppActionProps = PropsRuntime<'conversation.session.header.actions'>
 
@@ -99,11 +100,15 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
 
   useEffect(() => {
     if (!open) return
+    const resumeAppInteractions = suspendAppRuntimeInteractions()
     const closeOutside = (event: PointerEvent): void => {
       if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setOpen(false)
     }
     document.addEventListener('pointerdown', closeOutside)
-    return () => { document.removeEventListener('pointerdown', closeOutside) }
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      resumeAppInteractions()
+    }
   }, [open])
 
   useEffect(() => {

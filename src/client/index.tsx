@@ -24,6 +24,12 @@ import {
   type AppInstanceController,
   type AppSurface,
 } from './app-registry.js'
+import {
+  APP_RUNTIME_INTERACTION_EVENT,
+  appRuntimeInteractionsSuspended,
+  computeInlineFrameClip,
+  observeFramePlacement,
+} from './frame-placement.js'
 import { currentViewId } from './view-binding.js'
 
 const API_PREFIX = '/api/mcp-apps'
@@ -75,9 +81,22 @@ function presentationMeta(value: unknown): McpAppPresentationMetaV1 | undefined 
   const meta = value as Partial<McpAppPresentationMetaV1>
   if (meta.kind !== 'dsh/mcp-app'
     || meta.version !== 1
+    || typeof meta.serverName !== 'string'
+    || !/^[A-Za-z0-9_-]{1,32}$/.test(meta.serverName)
+    || typeof meta.connectionGeneration !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(meta.connectionGeneration)
+    || (meta.sessionId !== undefined
+      && (typeof meta.sessionId !== 'string'
+        || meta.sessionId.length === 0
+        || meta.sessionId.length > 256))
     || typeof meta.viewId !== 'string'
     || typeof meta.publicToolName !== 'string'
     || typeof meta.resourceUri !== 'string'
+    || (meta.projectId !== undefined
+      && (typeof meta.projectId !== 'string'
+        || meta.projectId.length === 0
+        || meta.projectId.length > 256))
+    || (meta.revision !== undefined && typeof meta.revision !== 'string')
     || meta.result === null
     || typeof meta.result !== 'object') return undefined
   return meta as McpAppPresentationMetaV1
@@ -199,6 +218,140 @@ function appHostContext(
   }
 }
 
+interface PersistentAppRuntime {
+  identity: string
+  iframe: HTMLIFrameElement
+  bridge?: AppBridge
+  ready: boolean
+  error?: string
+  displayMode: DisplayMode
+  frameHeight: number
+  host?: HTMLElement
+  stopPlacementObservation?: () => void
+}
+
+const persistentAppRuntimes = new Map<string, PersistentAppRuntime>()
+let parkingRoot: HTMLElement | undefined
+
+function appParkingRoot(): HTMLElement {
+  if (parkingRoot === undefined) {
+    parkingRoot = document.body.appendChild(document.createElement('div'))
+    parkingRoot.dataset.mcpAppParking = ''
+    Object.assign(parkingRoot.style, {
+      position: 'fixed',
+      inset: '0',
+      zIndex: '2147483001',
+      pointerEvents: 'none',
+    })
+  }
+  return parkingRoot
+}
+
+function parkAppRuntime(runtime: PersistentAppRuntime): void {
+  runtime.stopPlacementObservation?.()
+  runtime.stopPlacementObservation = undefined
+  runtime.host = undefined
+  Object.assign(runtime.iframe.style, {
+    left: '0',
+    top: '0',
+    opacity: '0',
+    pointerEvents: 'none',
+  })
+}
+
+function inlineAppRuntimeClip(
+  host: HTMLElement,
+  bounds: DOMRect,
+): { clipPath: string; visible: boolean } {
+  const scrollport = host.closest<HTMLElement>('[data-conversation-scroll]')
+  const composer = scrollport?.querySelector<HTMLElement>('[data-composer-seat]')
+  return computeInlineFrameClip(
+    bounds,
+    scrollport?.getBoundingClientRect(),
+    { width: window.innerWidth, height: window.innerHeight },
+    composer?.getBoundingClientRect(),
+  )
+}
+
+function placeAppRuntime(runtime: PersistentAppRuntime): void {
+  const host = runtime.host
+  if (host === undefined || !host.isConnected) {
+    parkAppRuntime(runtime)
+    return
+  }
+  const bounds = host.getBoundingClientRect()
+  const placement = runtime.displayMode === 'fullscreen'
+    ? { clipPath: 'none', visible: true }
+    : inlineAppRuntimeClip(host, bounds)
+  const interactive = runtime.ready
+    && placement.visible
+    && !appRuntimeInteractionsSuspended()
+  Object.assign(runtime.iframe.style, {
+    left: `${String(bounds.left)}px`,
+    top: `${String(bounds.top)}px`,
+    width: `${String(Math.max(1, bounds.width))}px`,
+    height: `${String(Math.max(1, bounds.height))}px`,
+    clipPath: placement.clipPath,
+    opacity: runtime.ready && placement.visible ? '1' : '0',
+    pointerEvents: interactive ? 'auto' : 'none',
+  })
+}
+
+function disposeAppRuntime(runtime: PersistentAppRuntime): void {
+  const bridge = runtime.bridge
+  runtime.bridge = undefined
+  runtime.ready = false
+  runtime.stopPlacementObservation?.()
+  runtime.stopPlacementObservation = undefined
+  runtime.host = undefined
+  runtime.iframe.remove()
+  if (bridge !== undefined) {
+    void timeout(bridge.teardownResource({}), 1_000, 'MCP App teardown timed out')
+      .catch(() => {})
+      .finally(() => {
+        void (bridge as unknown as { close(): Promise<void> }).close()
+      })
+  }
+}
+
+function clearPersistentAppRuntimes(): void {
+  for (const runtime of persistentAppRuntimes.values()) disposeAppRuntime(runtime)
+  persistentAppRuntimes.clear()
+  parkingRoot?.remove()
+  parkingRoot = undefined
+}
+
+function persistentAppRuntime(
+  key: string,
+  identity: string,
+  title: string,
+): PersistentAppRuntime {
+  const current = persistentAppRuntimes.get(key)
+  if (current?.identity === identity) return current
+  if (current !== undefined) disposeAppRuntime(current)
+  const iframe = document.createElement('iframe')
+  iframe.title = title
+  iframe.style.position = 'fixed'
+  iframe.style.left = '0'
+  iframe.style.top = '0'
+  iframe.style.width = '1px'
+  iframe.style.height = '320px'
+  iframe.style.border = '0'
+  iframe.style.background = 'transparent'
+  iframe.style.opacity = '0'
+  iframe.style.pointerEvents = 'none'
+  appParkingRoot().appendChild(iframe)
+  const runtime: PersistentAppRuntime = {
+    identity,
+    iframe,
+    ready: false,
+    displayMode: 'inline',
+    frameHeight: 320,
+  }
+  persistentAppRuntimes.set(key, runtime)
+  return runtime
+}
+
 function McpAppRow({
   block,
   callId,
@@ -207,7 +360,7 @@ function McpAppRow({
   sessionId,
 }: ToolCallViewProps & McpAppRowInjected & { descriptor: McpAppCatalogItem }) {
   const rootRef = useRef<HTMLDivElement>(null)
-  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const iframeHostRef = useRef<HTMLDivElement>(null)
   const bridgeRef = useRef<AppBridge>()
   const displayModeRef = useRef<DisplayMode>('inline')
   const inlineHeightRef = useRef(320)
@@ -218,28 +371,94 @@ function McpAppRow({
   const scrollPositionRef = useRef<{ element: HTMLElement; top: number }>()
   const scrollRestoreFrameRef = useRef<number>()
   const sendMessageRef = useRef(sendMessage)
+  const latestResultRef = useRef<CallToolResult>()
+  const latestArgsRef = useRef<Record<string, unknown>>({})
   const [error, setError] = useState<string>()
   const [ready, setReady] = useState(false)
+  const [ownsInstance, setOwnsInstance] = useState(false)
   const [displayMode, setDisplayMode] = useState<DisplayMode>('inline')
   const [frameHeight, setFrameHeight] = useState(320)
   const [located, setLocated] = useState(false)
+  const [retry, setRetry] = useState(0)
   sendMessageRef.current = sendMessage
 
   const settled: ToolResultNode | undefined = 'kind' in block ? block : undefined
   const meta = presentationMeta(settled?.meta)
   const sessionKey = String(sessionId)
+  const instanceId = meta?.projectId === undefined
+    ? `${descriptor.serverName}:call:${callId}`
+    : `${descriptor.serverName}:project:${meta.projectId}`
+  const runtimeKey = `${sessionKey}\0${instanceId}`
+  let viewId: string | undefined
+  let bindingError: string | undefined
+  if (meta !== undefined) {
+    try {
+      viewId = currentViewId(meta, descriptor)
+    } catch (cause) {
+      bindingError = cause instanceof Error ? cause.message : String(cause)
+    }
+  }
+  const hasAppResult = settled !== undefined
+    && meta !== undefined
+    && bindingError === undefined
+  const currentRuntimeIdentity = JSON.stringify([
+    descriptor.connectionGeneration,
+    descriptor.sandboxOrigin,
+    descriptor.viewId,
+    descriptor.resourceUri,
+  ])
+  const runtimeIdentity = viewId === undefined || meta === undefined
+    ? ''
+    : JSON.stringify([
+        descriptor.connectionGeneration,
+        descriptor.sandboxOrigin,
+        viewId,
+        meta.resourceUri,
+      ])
+  const runtime = useMemo(() => viewId === undefined
+    ? undefined
+    : persistentAppRuntime(
+        runtimeKey,
+        runtimeIdentity,
+        `MCP App: ${descriptor.publicToolName}`,
+      ), [descriptor.publicToolName, retry, runtimeIdentity, runtimeKey, viewId])
+  if (meta !== undefined && settled !== undefined) {
+    latestResultRef.current = meta.result as CallToolResult
+    latestArgsRef.current = argsOf(settled)
+  }
   const controller = useMemo<AppInstanceController>(() => ({
     sessionId: sessionKey,
+    instanceId,
     callId,
     publicToolName: descriptor.publicToolName,
     ready: false,
     surface: 'inline',
+    result: latestResultRef.current,
+    args: latestArgsRef.current,
+    acceptResult: (result, args) => {
+      latestResultRef.current = result as CallToolResult
+      latestArgsRef.current = args
+      runtime?.bridge?.sendToolInput({ arguments: args })
+      runtime?.bridge?.sendToolResult(result as CallToolResult)
+    },
+    setOwner: owner => { setOwnsInstance(owner) },
     requestSurface: surface => { requestSurfaceRef.current(surface) },
     locate: () => { locateRef.current() },
-  }), [callId, descriptor.publicToolName, sessionKey])
+  }), [callId, descriptor.publicToolName, instanceId, runtime, sessionKey])
+  controller.surface = runtime?.displayMode ?? 'inline'
+  controller.result = latestResultRef.current
+  controller.args = latestArgsRef.current
+
+  useEffect(() => {
+    if (bindingError === undefined) return
+    const stale = persistentAppRuntimes.get(runtimeKey)
+    if (stale === undefined || stale.identity === currentRuntimeIdentity) return
+    persistentAppRuntimes.delete(runtimeKey)
+    disposeAppRuntime(stale)
+  }, [bindingError, currentRuntimeIdentity, runtimeKey])
 
   requestSurfaceRef.current = surface => {
-    const iframe = iframeRef.current
+    const iframe = runtime?.iframe
     const previousSurface = displayModeRef.current
     if (surface === 'fullscreen' && previousSurface === 'inline') {
       const scrollport = rootRef.current?.closest<HTMLElement>('[data-conversation-scroll]')
@@ -250,13 +469,12 @@ function McpAppRow({
     const scrollPosition = scrollPositionRef.current
     displayModeRef.current = surface
     controller.surface = surface
-    if (iframe !== null) {
-      iframe.style.height = surface === 'fullscreen'
-        ? '100%'
-        : `${String(inlineHeightRef.current)}px`
-    }
+    if (runtime !== undefined) runtime.displayMode = surface
     setDisplayMode(surface)
-    if (iframe !== null) {
+    if (iframe !== undefined) {
+      window.requestAnimationFrame(() => {
+        if (runtime !== undefined) placeAppRuntime(runtime)
+      })
       bridgeRef.current?.setHostContext(appHostContext(iframe, surface, rootRef.current))
     }
     if (scrollPosition !== undefined && previousSurface !== surface) {
@@ -294,7 +512,7 @@ function McpAppRow({
   }
 
   useEffect(() => {
-    if (settled === undefined || meta === undefined) return
+    if (!hasAppResult) return
     const dispose = appRegistry.register(controller)
     return () => {
       controller.ready = false
@@ -305,21 +523,136 @@ function McpAppRow({
         window.cancelAnimationFrame(scrollRestoreFrameRef.current)
       }
     }
-  }, [controller, meta, settled])
+  }, [controller, hasAppResult])
 
   useEffect(() => {
-    const iframe = iframeRef.current
-    if (iframe === null || settled === undefined || meta === undefined) return
+    const host = iframeHostRef.current
+    if (!ownsInstance
+      || runtime === undefined
+      || host === null
+      || !hasAppResult
+      || viewId === undefined
+      || latestResultRef.current === undefined) return
+    const initialResult = latestResultRef.current
+    const iframe = runtime.iframe
+    runtime.host = host
+    const positionFrame = (): void => { placeAppRuntime(runtime) }
+    const stopPlacementObservation = observeFramePlacement(
+      () => runtime.host === host && host.isConnected
+        ? host.getBoundingClientRect()
+        : undefined,
+      positionFrame,
+    )
+    runtime.stopPlacementObservation = stopPlacementObservation
+    const resizeObserver = new ResizeObserver(positionFrame)
+    resizeObserver.observe(host)
+    const scrollport = host.closest<HTMLElement>('[data-conversation-scroll]')
+    const composer = scrollport?.querySelector<HTMLElement>('[data-composer-seat]')
+    if (scrollport !== null && scrollport !== undefined) resizeObserver.observe(scrollport)
+    if (composer !== null && composer !== undefined) resizeObserver.observe(composer)
+    window.addEventListener('resize', positionFrame)
+    window.addEventListener(APP_RUNTIME_INTERACTION_EVENT, positionFrame)
+    document.addEventListener('scroll', positionFrame, true)
+    positionFrame()
+    displayModeRef.current = runtime.displayMode
+    inlineHeightRef.current = runtime.frameHeight
+    setDisplayMode(runtime.displayMode)
+    setFrameHeight(runtime.frameHeight)
+    setReady(runtime.ready)
+    setError(runtime.error)
+    positionFrame()
     let disposed = false
-    let bridge: AppBridge | undefined
-    controller.ready = false
-    appRegistry.changed(controller)
-    requestSurfaceRef.current('inline')
-    setError(undefined)
-    setReady(false)
+    let bridge = runtime.bridge
+
+    const bindBridge = (current: AppBridge, viewId: string): void => {
+      bridgeRef.current = current
+      current.oncalltool = (params, extra) => api<CallToolResult>('tool', {
+        viewId,
+        name: params.name,
+        arguments: params.arguments ?? {},
+        sessionId: sessionKey,
+        connectionGeneration: descriptor.connectionGeneration,
+      }).then(result => {
+        extra.signal.throwIfAborted()
+        return result
+      })
+      current.onreadresource = (params, extra) => api<ReadResourceResult>('resource', {
+        viewId,
+        uri: params.uri,
+      }).then(result => {
+        extra.signal.throwIfAborted()
+        return result
+      })
+      current.onmessage = (params, extra) => {
+        extra.signal.throwIfAborted()
+        return sendMessageRef.current(params)
+      }
+      current.onupdatemodelcontext = (params, extra) => {
+        extra.signal.throwIfAborted()
+        return api<Record<string, never>>('model-context', {
+          viewId,
+          sessionId: sessionKey,
+          connectionGeneration: descriptor.connectionGeneration,
+          ...params,
+        }).then(result => {
+          extra.signal.throwIfAborted()
+          return result
+        })
+      }
+      current.ondownloadfile = (params, extra) => {
+        extra.signal.throwIfAborted()
+        return downloadEmbedded(params)
+      }
+      current.onrequestdisplaymode = async ({ mode }, extra) => {
+        extra.signal.throwIfAborted()
+        if (mode !== 'inline' && mode !== 'fullscreen') return { mode: displayModeRef.current }
+        return appRegistry.requestSurface(sessionKey, callId, mode)
+          ? { mode }
+          : { mode: displayModeRef.current }
+      }
+      current.onsizechange = params => {
+        if (displayModeRef.current === 'fullscreen') return
+        if (typeof params.height !== 'number' || !Number.isFinite(params.height)) return
+        inlineHeightRef.current = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(params.height)))
+        runtime.frameHeight = inlineHeightRef.current
+        setFrameHeight(inlineHeightRef.current)
+        positionFrame()
+      }
+    }
+
+    const markReady = (current: AppBridge): void => {
+      if (disposed
+        || runtime.ready
+        || runtime.bridge !== current
+        || persistentAppRuntimes.get(runtimeKey) !== runtime) return
+      current.sendToolInput({ arguments: latestArgsRef.current })
+      current.sendToolResult(latestResultRef.current ?? initialResult)
+      runtime.ready = true
+      runtime.error = undefined
+      controller.ready = true
+      appRegistry.changed(controller)
+      appRegistry.activate(sessionKey, callId)
+      positionFrame()
+      setError(undefined)
+      setReady(true)
+    }
 
     const run = async (): Promise<void> => {
-      const viewId = currentViewId(meta, descriptor)
+      if (bridge !== undefined && runtime.ready) {
+        bindBridge(bridge, viewId)
+        bridge.sendToolInput({ arguments: latestArgsRef.current })
+        bridge.sendToolResult(latestResultRef.current ?? initialResult)
+        controller.ready = true
+        appRegistry.changed(controller)
+        positionFrame()
+        setReady(true)
+        return
+      }
+      controller.ready = false
+      appRegistry.changed(controller)
+      runtime.error = undefined
+      setError(undefined)
+      setReady(false)
       const view = await api<McpAppView>('view', { viewId })
       if (disposed) return
       const sandboxOrigin = loopbackSandboxOrigin(descriptor.sandboxOrigin)
@@ -340,51 +673,23 @@ function McpAppRow({
           serverResources: {},
           downloadFile: {},
           message: { text: {} },
+          updateModelContext: { text: {}, structuredContent: {} },
         },
         {
           hostContext: appHostContext(iframe, displayModeRef.current, rootRef.current),
         },
       )
+      runtime.bridge = bridge
       bridgeRef.current = bridge
-      bridge.oncalltool = (params, extra) => api<CallToolResult>('tool', {
-        viewId,
-        name: params.name,
-        arguments: params.arguments ?? {},
-      }).then(result => {
-        extra.signal.throwIfAborted()
-        return result
-      })
-      bridge.onreadresource = (params, extra) => api<ReadResourceResult>('resource', {
-        viewId,
-        uri: params.uri,
-      }).then(result => {
-        extra.signal.throwIfAborted()
-        return result
-      })
-      bridge.onmessage = (params, extra) => {
-        extra.signal.throwIfAborted()
-        return sendMessageRef.current(params)
-      }
-      bridge.ondownloadfile = (params, extra) => {
-        extra.signal.throwIfAborted()
-        return downloadEmbedded(params)
-      }
-      bridge.onrequestdisplaymode = async ({ mode }, extra) => {
-        extra.signal.throwIfAborted()
-        if (mode !== 'inline' && mode !== 'fullscreen') return { mode: displayModeRef.current }
-        return appRegistry.requestSurface(sessionKey, callId, mode)
-          ? { mode }
-          : { mode: displayModeRef.current }
-      }
-      bridge.onsizechange = params => {
-        if (displayModeRef.current === 'fullscreen') return
-        if (typeof params.height !== 'number' || !Number.isFinite(params.height)) return
-        inlineHeightRef.current = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(params.height)))
-        setFrameHeight(inlineHeightRef.current)
-        iframe.style.height = `${String(inlineHeightRef.current)}px`
-      }
+      bindBridge(bridge, viewId)
       const initialized = timeout(new Promise<void>((resolve) => {
-        if (bridge !== undefined) bridge.oninitialized = () => resolve()
+        const current = bridge
+        if (current !== undefined) {
+          current.oninitialized = () => {
+            markReady(current)
+            resolve()
+          }
+        }
       }), READY_TIMEOUT_MS, 'MCP App did not initialize')
 
       await bridge.connect(new PostMessageTransport(iframe.contentWindow, iframe.contentWindow))
@@ -393,37 +698,53 @@ function McpAppRow({
         sandbox: 'allow-scripts allow-same-origin',
       })
       await initialized
-      if (disposed) return
-      bridge.sendToolInput({ arguments: argsOf(settled) })
-      bridge.sendToolResult(meta.result as CallToolResult)
-      controller.ready = true
-      appRegistry.changed(controller)
-      appRegistry.activate(sessionKey, callId)
-      setReady(true)
     }
 
     void run().catch(cause => {
       if (!disposed) {
+        runtime.ready = false
+        runtime.error = cause instanceof Error ? cause.message : String(cause)
         controller.ready = false
         appRegistry.changed(controller)
-        setError(cause instanceof Error ? cause.message : String(cause))
+        setError(runtime.error)
       }
     })
     return () => {
       disposed = true
       controller.ready = false
       appRegistry.changed(controller)
-      if (bridge !== undefined) {
-        void timeout(bridge.teardownResource({}), 1_000, 'MCP App teardown timed out')
-          .catch(() => {})
-          .finally(() => {
-            void (bridge as unknown as { close(): Promise<void> }).close()
-          })
+      resizeObserver.disconnect()
+      window.removeEventListener('resize', positionFrame)
+      window.removeEventListener(APP_RUNTIME_INTERACTION_EVENT, positionFrame)
+      document.removeEventListener('scroll', positionFrame, true)
+      if (runtime.stopPlacementObservation === stopPlacementObservation) {
+        stopPlacementObservation()
+        runtime.stopPlacementObservation = undefined
+      }
+      if (runtime.host === host) {
+        parkAppRuntime(runtime)
+      }
+      if (meta.projectId === undefined || !runtime.ready) {
+        if (persistentAppRuntimes.get(runtimeKey) === runtime) {
+          persistentAppRuntimes.delete(runtimeKey)
+          disposeAppRuntime(runtime)
+        }
       }
       if (bridgeRef.current === bridge) bridgeRef.current = undefined
-      iframe.removeAttribute('src')
     }
-  }, [callId, controller, descriptor.sandboxOrigin, meta, sessionKey, settled])
+  }, [
+    callId,
+    controller,
+    descriptor.connectionGeneration,
+    descriptor.sandboxOrigin,
+    hasAppResult,
+    ownsInstance,
+    retry,
+    runtime,
+    runtimeKey,
+    sessionKey,
+    viewId,
+  ])
 
   if (settled === undefined) {
     return <div data-mcp-app-status="running">Running MCP App tool...</div>
@@ -431,12 +752,49 @@ function McpAppRow({
   if (meta === undefined) {
     return <pre data-mcp-app-fallback>{fallbackText(settled)}</pre>
   }
+  if (bindingError !== undefined) {
+    return (
+      <div data-mcp-app-error data-mcp-app-definition-error>
+        <strong>MCP App unavailable</strong>
+        <pre>{fallbackText(settled)}</pre>
+        <small>{bindingError}</small>
+      </div>
+    )
+  }
+  if (!ownsInstance) {
+    return (
+      <div data-mcp-app-update={instanceId}>
+        Editor updated in place.{' '}
+        <button
+          type="button"
+          onClick={() => { appRegistry.locate(sessionKey, callId) }}
+        >
+          Locate Editor
+        </button>
+      </div>
+    )
+  }
   if (error !== undefined) {
     return (
       <div data-mcp-app-error>
         <strong>MCP App unavailable</strong>
         <pre>{fallbackText(settled)}</pre>
         <small>{error}</small>
+        <button
+          type="button"
+          onClick={() => {
+            if (runtime !== undefined) {
+              if (persistentAppRuntimes.get(runtimeKey) === runtime) {
+                persistentAppRuntimes.delete(runtimeKey)
+              }
+              disposeAppRuntime(runtime)
+            }
+            setError(undefined)
+            setRetry(value => value + 1)
+          }}
+        >
+          Retry
+        </button>
       </div>
     )
   }
@@ -523,15 +881,12 @@ function McpAppRow({
             </button>
           </div>
         )}
-        <iframe
-          ref={iframeRef}
-          title={`MCP App: ${descriptor.publicToolName}`}
+        <div
+          ref={iframeHostRef}
+          data-mcp-app-frame-host
           style={{
-            display: ready ? 'block' : 'none',
             width: '100%',
             height: fullscreen ? '100%' : frameHeight,
-            border: 0,
-            background: 'transparent',
           }}
         />
       </div>
@@ -546,7 +901,10 @@ function descriptorKey(item: McpAppCatalogItem): string {
 /** Register current MCP App tools into the dynamic keyed Tool view slot. */
 export function apply(ctx: ClientContext): void {
   const sessions = ctx.sessions as unknown as ISessions
-  ctx.effect(() => () => { appRegistry.clear() }, 'mcp-apps: clear app registry')
+  ctx.effect(() => () => {
+    appRegistry.clear()
+    clearPersistentAppRuntimes()
+  }, 'mcp-apps: clear app registry')
   ctx.slots.inject(
     'conversation.session.header.actions',
     () => ctx.slots.register({

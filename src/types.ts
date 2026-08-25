@@ -53,20 +53,29 @@ export interface McpAppResult {
   content: JsonValue[]
   structuredContent?: JsonValue
   _meta?: JsonValue
+  /** Host-admitted model content; never forwarded back into the MCP App. */
+  modelContent?: JsonValue[]
 }
 
 /** Durable UI-only payload attached to a settled Harness tool result. */
 export interface McpAppPresentationMetaV1 {
   kind: 'dsh/mcp-app'
   version: 1
+  serverName: string
+  connectionGeneration: string
+  sessionId?: string
   viewId: string
   publicToolName: string
   resourceUri: string
+  projectId?: string
+  revision?: string
   result: McpAppResult
 }
 
 /** Browser-safe descriptor for one model-visible tool with an MCP App View. */
 export interface McpAppCatalogItem {
+  serverName: string
+  connectionGeneration: string
   publicToolName: string
   resourceUri: string
   sandboxOrigin: string

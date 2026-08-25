@@ -7,7 +7,8 @@ const server = new McpServer({
   version: '0.0.0',
 })
 
-server.registerPrompt('test-review-loop', {
+let promptText = 'Run independent test reviews, score the result, and repair failures below {threshold}.'
+const reviewPrompt = server.registerPrompt('test-review-loop', {
   description: 'Guides a test, score, and repair workflow.',
   argsSchema: {
     threshold: z.string(),
@@ -17,7 +18,7 @@ server.registerPrompt('test-review-loop', {
     role: 'user',
     content: {
       type: 'text',
-      text: `Run independent test reviews, score the result, and repair failures below ${threshold}.`,
+      text: promptText.replace('{threshold}', threshold),
     },
   }],
 }))
@@ -31,5 +32,21 @@ server.registerPrompt('assistant-history', {}, () => ({
     },
   }],
 }))
+
+server.registerTool('set_prompt_text', {
+  inputSchema: {
+    text: z.string(),
+  },
+}, ({ text }) => {
+  promptText = text
+  server.sendPromptListChanged()
+  return { content: [{ type: 'text', text: 'updated' }] }
+})
+
+server.registerTool('remove_review_prompt', {}, () => {
+  reviewPrompt.remove()
+  server.sendPromptListChanged()
+  return { content: [{ type: 'text', text: 'removed' }] }
+})
 
 await server.connect(new StdioServerTransport())

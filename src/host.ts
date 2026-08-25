@@ -44,6 +44,9 @@ const MAX_PUBLIC_NAME_LENGTH = 64
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g
 const HASH_LENGTH = 12
 const DSH_WORKSPACE_META_KEY = 'ai.deepseek.dsh/workspace'
+const DSH_SESSION_META_KEY = 'ai.deepseek.dsh/session'
+const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
 interface ResolvedConfig {
   servers: ServerConfig[]
@@ -64,6 +67,18 @@ interface ViewBinding {
   item: McpAppCatalogItem
   rawToolName: string
   state: ServerState
+}
+
+interface ViewModelContext {
+  viewId: string
+  sessionId: string
+  connectionGeneration: string
+  text: string
+}
+
+interface ModelContextUpdate {
+  content?: unknown
+  structuredContent?: unknown
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
@@ -195,6 +210,147 @@ function resultText(result: McpAppResult, rawName: string): string {
   return parts.length > 0 ? parts.join('\n') : `Tool "${rawName}" completed without text output.`
 }
 
+interface AttachmentWriter {
+  saveImages(inputs: Array<{
+    data: Uint8Array
+    mediaType: string
+    name?: string
+  }>): Promise<Array<{
+    attachmentId: string
+    mediaType: string
+    bytes: number
+    width: number
+    height: number
+    name?: string
+  }>>
+}
+
+interface ModelResolver {
+  resolveModelInfo(
+    provider: string,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<{ inputModalities?: readonly string[] }>
+}
+
+function attachmentWriter(ctx: Context): AttachmentWriter | undefined {
+  const service = (ctx as unknown as { get(name: string): unknown }).get('attachments')
+  return service !== null
+    && typeof service === 'object'
+    && 'saveImages' in service
+    && typeof service.saveImages === 'function'
+    ? service as AttachmentWriter
+    : undefined
+}
+
+function modelResolver(ctx: Context): ModelResolver | undefined {
+  const service = (ctx as unknown as { get(name: string): unknown }).get('llm')
+  return service !== null
+    && typeof service === 'object'
+    && 'resolveModelInfo' in service
+    && typeof service.resolveModelInfo === 'function'
+    ? service as ModelResolver
+    : undefined
+}
+
+function imageUnavailable(mediaType: string, reason: string): JsonValue {
+  return {
+    type: 'text',
+    text: `[image unavailable: ${mediaType}; ${reason}; raw image data remains available to programmatic callers]`,
+  }
+}
+
+async function modelContent(
+  ctx: Context,
+  result: CallToolResult,
+  rawName: string,
+  exec: ToolExecution,
+): Promise<JsonValue[]> {
+  const content: JsonValue[] = []
+  const images: Array<{ index: number; data: Uint8Array; mediaType: string }> = []
+  let invalidImage = false
+  for (const block of result.content) {
+    if (block.type === 'text') {
+      content.push({ type: 'text', text: block.text })
+    } else if (block.type === 'image') {
+      if (!IMAGE_MEDIA_TYPES.has(block.mimeType)
+        || !CANONICAL_BASE64.test(block.data)) {
+        invalidImage = true
+        content.push(imageUnavailable(block.mimeType, 'invalid image content'))
+        continue
+      }
+      const data = Buffer.from(block.data, 'base64')
+      if (data.toString('base64') !== block.data) {
+        invalidImage = true
+        content.push(imageUnavailable(block.mimeType, 'invalid image content'))
+        continue
+      }
+      images.push({ index: content.length, data, mediaType: block.mimeType })
+      content.push(null)
+    } else if (block.type === 'resource' && 'text' in block.resource) {
+      content.push({
+        type: 'text',
+        text: `[${block.resource.uri}]\n${block.resource.text}`,
+      })
+    } else {
+      content.push({
+        type: 'text',
+        text: `MCP content retained in the tool result: ${JSON.stringify(block)}`,
+      })
+    }
+  }
+  if (images.length > 0) {
+    const writer = attachmentWriter(ctx)
+    const routed = exec.agent?.session.requestHeader()?.config
+    const provider = routed?.provider ?? exec.agent?.options.provider
+    const model = routed?.model ?? exec.agent?.options.model
+    const llm = modelResolver(ctx)
+    let reason: string | undefined
+    if (invalidImage) {
+      reason = 'another image in the same result was invalid'
+    } else if (writer === undefined) {
+      reason = 'no attachment store is mounted'
+    } else if (provider === undefined || model === undefined || llm === undefined) {
+      reason = 'the current model route could not be resolved'
+    } else {
+      try {
+        const info = await llm.resolveModelInfo(provider, model, exec.signal)
+        if (info.inputModalities?.includes('image') !== true) {
+          reason = `model "${model}" does not declare image input`
+        }
+      } catch {
+        reason = 'the current model route could not be verified'
+      }
+    }
+    exec.signal.throwIfAborted()
+    if (reason === undefined && writer !== undefined) {
+      try {
+        const refs = await writer.saveImages(images.map(image => ({
+          data: image.data,
+          mediaType: image.mediaType,
+        })))
+        for (const [offset, image] of images.entries()) {
+          content[image.index] = {
+            type: 'image',
+            attachment: refs[offset] as unknown as JsonValue,
+          }
+        }
+      } catch {
+        reason = 'durable image storage rejected the result'
+      }
+    }
+    if (reason !== undefined) {
+      for (const image of images) {
+        content[image.index] = imageUnavailable(image.mediaType, reason)
+      }
+    }
+  }
+  if (content.length === 0) {
+    content.push({ type: 'text', text: `Tool "${rawName}" completed without content output.` })
+  }
+  return content
+}
+
 function createTransport(config: ServerConfig) {
   if (config.transport === 'stdio') {
     return new StdioClientTransport({
@@ -210,11 +366,16 @@ function createTransport(config: ServerConfig) {
 }
 
 class ServerState {
-  readonly client: Client
+  client: Client
   readonly tools = new Map<string, { tool: Tool; visibility: Visibility }>()
+  private _connectionGeneration = randomUUID()
   private toolDisposers = new Map<string, () => void>()
-  private promptDisposers: Array<() => void> = []
+  private promptSections = new Map<string, { hash: string; dispose: () => void }>()
   private viewIds = new Set<string>()
+  private reconnectTimer?: ReturnType<typeof setTimeout>
+  private reconnecting = false
+  private disposed = false
+  private reconnectDelayMs = 250
 
   constructor(
     private readonly ctx: Context,
@@ -222,7 +383,15 @@ class ServerState {
     private readonly host: McpAppsHost,
     private readonly resolved: ResolvedConfig,
   ) {
-    this.client = new Client(
+    this.client = this.createClient()
+  }
+
+  get connectionGeneration(): string {
+    return this._connectionGeneration
+  }
+
+  private createClient(): Client {
+    const client = new Client(
       { name: 'dsh-uni-editor', version: '0.3.1' },
       {
         capabilities: {
@@ -234,25 +403,70 @@ class ServerState {
         },
       } as ConstructorParameters<typeof Client>[1],
     )
-  }
-
-  async start(): Promise<void> {
-    this.client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
       try {
         await this.sync()
       } catch (error) {
         this.ctx.logger.error(`mcp-apps(${this.config.serverName}): tool re-sync failed: ${String(error)}`)
       }
     })
-    this.client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
+    client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
       try {
         await this.syncPrompts()
       } catch (error) {
         this.ctx.logger.error(`mcp-apps(${this.config.serverName}): prompt re-sync failed: ${String(error)}`)
       }
     })
-    await this.client.connect(createTransport(this.config))
+    client.onerror = error => {
+      this.ctx.logger.error(`mcp-apps(${this.config.serverName}): MCP transport error: ${String(error)}`)
+    }
+    client.onclose = () => {
+      if (client === this.client && !this.disposed) this.scheduleReconnect()
+    }
+    return client
+  }
+
+  private async connect(client: Client): Promise<void> {
+    await client.connect(createTransport(this.config))
+    if (client !== this.client || this.disposed) {
+      await client.close()
+      return
+    }
+    this._connectionGeneration = randomUUID()
     await Promise.all([this.sync(), this.syncPrompts()])
+    this.reconnectDelayMs = 250
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed || this.reconnecting || this.reconnectTimer !== undefined) return
+    const delay = this.reconnectDelayMs
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      void this.reconnect()
+    }, delay)
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.disposed || this.reconnecting) return
+    this.reconnecting = true
+    const client = this.createClient()
+    this.client = client
+    let connected = false
+    try {
+      await this.connect(client)
+      connected = true
+    } catch (error) {
+      this.ctx.logger.error(`mcp-apps(${this.config.serverName}): reconnect failed: ${String(error)}`)
+      this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 5_000)
+      await client.close().catch(() => {})
+    } finally {
+      this.reconnecting = false
+      if (!connected) this.scheduleReconnect()
+    }
+  }
+
+  async start(): Promise<void> {
+    await this.connect(this.client)
   }
 
   private async listTools(): Promise<Tool[]> {
@@ -287,12 +501,16 @@ class ServerState {
       throw new Error(`mcp-apps(${this.config.serverName}): configured autoInject prompts but server has no prompts capability`)
     }
     const available = new Set((await this.listPrompts()).map(prompt => prompt.name))
-    const sections = await Promise.all(injections.map(async (injection) => {
-      if (!available.has(injection.name)) {
-        throw new Error(
-          `mcp-apps(${this.config.serverName}): auto-injected prompt ${JSON.stringify(injection.name)} is unavailable`,
-        )
-      }
+    const remaining = injections.filter(injection => available.has(injection.name))
+    const active = new Set(remaining.map(injection => (
+      `${this.config.serverName}\0${injection.name}`
+    )))
+    for (const [key, current] of this.promptSections) {
+      if (active.has(key)) continue
+      current.dispose()
+      this.promptSections.delete(key)
+    }
+    const sections = await Promise.all(remaining.map(async (injection) => {
       const result = await this.client.getPrompt(
         {
           name: injection.name,
@@ -300,21 +518,32 @@ class ServerState {
         },
         { timeout: this.resolved.toolCallTimeoutMs },
       )
+      const text = renderInjectedPrompt(this.config.serverName, injection.name, result)
       return {
+        key: `${this.config.serverName}\0${injection.name}`,
         name: `mcp-prompt:${this.config.serverName}:${injection.name}`,
         order: 130,
-        text: renderInjectedPrompt(this.config.serverName, injection.name, result),
+        text,
+        hash: createHash('sha256').update(text).digest('hex'),
       }
     }))
-    for (const dispose of this.promptDisposers) dispose()
-    this.promptDisposers = []
-    const nextDisposers: Array<() => void> = []
-    try {
-      for (const section of sections) nextDisposers.push(this.ctx.systemPrompt.section(section))
-      this.promptDisposers = nextDisposers
-    } catch (error) {
-      for (const dispose of nextDisposers) dispose()
-      throw error
+    for (const section of sections) {
+      const current = this.promptSections.get(section.key)
+      if (current?.hash === section.hash) continue
+      current?.dispose()
+      this.promptSections.delete(section.key)
+      const dispose = this.ctx.systemPrompt.section({
+        name: section.name,
+        order: section.order,
+        text: section.text,
+      })
+      this.promptSections.set(section.key, { hash: section.hash, dispose })
+    }
+    const unavailable = injections.find(injection => !available.has(injection.name))
+    if (unavailable !== undefined) {
+      throw new Error(
+        `mcp-apps(${this.config.serverName}): auto-injected prompt ${JSON.stringify(unavailable.name)} is unavailable`,
+      )
     }
   }
 
@@ -326,24 +555,72 @@ class ServerState {
           content: { type: 'array', items: {} },
           structuredContent: {},
           _meta: {},
+          modelContent: { type: 'array', items: {} },
+          uiSessionId: { type: 'string' },
         },
         required: ['content'],
         additionalProperties: false,
       },
       render(_args, value) {
-        return [{ type: 'text', text: resultText(value as unknown as McpAppResult, rawName) }]
+        const result = value as unknown as McpAppResult
+        return (result.modelContent ?? [{
+          type: 'text',
+          text: resultText(result, rawName),
+        }]) as ReturnType<ToolDefinition['output']['render']>
       },
       ...view === undefined
         ? {}
         : {
             presentationMeta: (_args: unknown, value: JsonValue): JsonValue => {
+              const result = value as unknown as McpAppResult & { uiSessionId?: string }
+              const resultMeta = result._meta !== null
+                && typeof result._meta === 'object'
+                && !Array.isArray(result._meta)
+                ? result._meta
+                : {}
               const meta: McpAppPresentationMetaV1 = {
                 kind: 'dsh/mcp-app',
                 version: 1,
+                serverName: this.config.serverName,
+                connectionGeneration: view.connectionGeneration,
+                ...typeof result.uiSessionId === 'string'
+                  ? { sessionId: result.uiSessionId }
+                  : {},
                 viewId: view.viewId,
                 publicToolName: view.publicToolName,
                 resourceUri: view.resourceUri,
-                result: value as unknown as McpAppResult,
+                ...typeof result.structuredContent === 'object'
+                  && result.structuredContent !== null
+                  && !Array.isArray(result.structuredContent)
+                  && typeof (result.structuredContent as Record<string, unknown>).projectId === 'string'
+                  ? {
+                      projectId: (result.structuredContent as Record<string, string>).projectId,
+                      ...typeof (result.structuredContent as Record<string, unknown>).revision === 'string'
+                        ? { revision: (result.structuredContent as Record<string, string>).revision }
+                        : {},
+                    }
+                  : {},
+                result: {
+                  content: result.content,
+                  ...result.structuredContent === undefined
+                    ? {}
+                    : { structuredContent: result.structuredContent },
+                  ...result.uiSessionId === undefined && result._meta === undefined
+                    ? {}
+                    : {
+                        _meta: {
+                          ...resultMeta,
+                          ...result.uiSessionId === undefined
+                            ? {}
+                            : {
+                                'ai.deepseek.dsh/app-instance': {
+                                  sessionId: result.uiSessionId,
+                                  serverName: this.config.serverName,
+                                },
+                              },
+                        },
+                      },
+                },
               }
               if (Buffer.byteLength(JSON.stringify(meta), 'utf8') > this.resolved.maxResultMetaBytes) {
                 return {
@@ -358,19 +635,41 @@ class ServerState {
     }
   }
 
-  private executor(rawName: string): ToolDefinition['execute'] {
+  private executor(
+    rawName: string,
+    view: McpAppCatalogItem | undefined,
+  ): ToolDefinition['execute'] {
     return async (args: unknown, exec: ToolExecution) => {
       const cwd = this.config.transport === 'stdio' && this.config.forwardWorkspace === true
         ? exec.agent?.session.header.cwd
         : undefined
+      const input = typeof args === 'object' && args !== null
+        ? args as Record<string, unknown>
+        : {}
       const result = await this.call(
         rawName,
-        typeof args === 'object' && args !== null ? args as Record<string, unknown> : {},
+        input,
         exec.signal,
-        cwd === undefined ? undefined : { [DSH_WORKSPACE_META_KEY]: { cwd } },
+        {
+          ...cwd === undefined ? {} : { [DSH_WORKSPACE_META_KEY]: { cwd } },
+          [DSH_SESSION_META_KEY]: {
+            sessionId: exec.agent?.session.header.id,
+            connectionGeneration: this.connectionGeneration,
+          },
+        },
       )
-      const value = resultValue(result)
+      const value = {
+        ...resultValue(result),
+        modelContent: await modelContent(this.ctx, result, rawName, exec),
+        ...exec.agent?.session.header.id === undefined
+          ? {}
+          : { uiSessionId: exec.agent.session.header.id },
+      }
       if (result.isError === true) throw new Error(resultText(value, rawName))
+      const sessionId = exec.agent?.session.header.id
+      if (view !== undefined && sessionId !== undefined) {
+        this.host.bindViewSession(view.viewId, sessionId, view.connectionGeneration)
+      }
       return value
     }
   }
@@ -393,6 +692,8 @@ class ServerState {
       const view = resourceUri === undefined
         ? undefined
         : {
+            serverName: this.config.serverName,
+            connectionGeneration: this.connectionGeneration,
             publicToolName: publicName,
             resourceUri,
             sandboxOrigin: this.host.sandboxOrigin,
@@ -404,12 +705,13 @@ class ServerState {
         description: tool.description ?? '',
         parameters: tool.inputSchema,
         output: this.output(tool.name, view),
-        execute: this.executor(tool.name),
+        execute: this.executor(tool.name, view),
       })
     }
 
     for (const dispose of this.toolDisposers.values()) dispose()
-    this.host.removeViews(this.viewIds)
+    // Preserve proven Session ownership for the same tool, but never its stale context.
+    const previousViewSessions = this.host.removeViews(this.viewIds)
     this.viewIds.clear()
     const nextDisposers = new Map<string, () => void>()
     try {
@@ -419,7 +721,7 @@ class ServerState {
       this.tools.clear()
       for (const [name, value] of nextTools) this.tools.set(name, value)
       for (const view of views) {
-        this.host.addView(view)
+        this.host.addView(view, previousViewSessions.get(view.rawToolName))
         this.viewIds.add(view.item.viewId)
       }
       this.toolDisposers = nextDisposers
@@ -470,10 +772,13 @@ class ServerState {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true
+    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
     for (const dispose of this.toolDisposers.values()) dispose()
     this.toolDisposers.clear()
-    for (const dispose of this.promptDisposers) dispose()
-    this.promptDisposers = []
+    for (const section of this.promptSections.values()) section.dispose()
+    this.promptSections.clear()
     this.host.removeViews(this.viewIds)
     this.viewIds.clear()
     await this.client.close()
@@ -482,18 +787,36 @@ class ServerState {
 
 class McpAppsHost {
   private readonly views = new Map<string, ViewBinding>()
+  private readonly viewSessions = new Map<string, Set<string>>()
+  private readonly modelContexts = new Map<string, ViewModelContext>()
 
   constructor(
     readonly sandboxOrigin: string,
     private readonly maxBodyBytes: number,
   ) {}
 
-  addView(binding: ViewBinding): void {
+  addView(binding: ViewBinding, sessions?: ReadonlySet<string>): void {
     this.views.set(binding.item.viewId, binding)
+    if (sessions !== undefined && sessions.size > 0) {
+      this.viewSessions.set(binding.item.viewId, new Set(sessions))
+    }
   }
 
-  removeViews(ids: Iterable<string>): void {
-    for (const id of ids) this.views.delete(id)
+  removeViews(ids: Iterable<string>): Map<string, Set<string>> {
+    const sessionsByTool = new Map<string, Set<string>>()
+    for (const id of ids) {
+      const binding = this.views.get(id)
+      const sessions = this.viewSessions.get(id)
+      if (binding !== undefined && sessions !== undefined) {
+        sessionsByTool.set(binding.rawToolName, new Set(sessions))
+      }
+      this.views.delete(id)
+      this.viewSessions.delete(id)
+      for (const [key, context] of this.modelContexts) {
+        if (context.viewId === id) this.modelContexts.delete(key)
+      }
+    }
+    return sessionsByTool
   }
 
   catalog(): McpAppCatalogItem[] {
@@ -506,6 +829,77 @@ class McpAppsHost {
     const binding = this.views.get(viewId)
     if (binding === undefined) throw new Error('MCP App View is unavailable')
     return binding
+  }
+
+  bindViewSession(
+    viewId: string,
+    sessionId: string,
+    connectionGeneration: string,
+  ): void {
+    const binding = this.binding(viewId)
+    if (binding.item.connectionGeneration !== connectionGeneration) return
+    const sessions = this.viewSessions.get(viewId) ?? new Set<string>()
+    sessions.add(sessionId)
+    this.viewSessions.set(viewId, sessions)
+  }
+
+  updateModelContext(
+    viewId: unknown,
+    sessionId: unknown,
+    connectionGeneration: unknown,
+    params: ModelContextUpdate,
+  ): void {
+    const binding = this.binding(viewId)
+    if (typeof sessionId !== 'string' || sessionId === '' || sessionId.length > 256) {
+      throw new Error('Harness Session identity is required')
+    }
+    if (connectionGeneration !== binding.item.connectionGeneration) {
+      throw new Error('MCP Server connection generation changed')
+    }
+    if (this.viewSessions.get(binding.item.viewId)?.has(sessionId) !== true) {
+      throw new Error('MCP App View does not belong to this Harness Session')
+    }
+    const content = params.content ?? []
+    if (!Array.isArray(content)
+      || content.some(block => block === null
+        || typeof block !== 'object'
+        || Array.isArray(block)
+        || (block as Record<string, unknown>).type !== 'text'
+        || typeof (block as Record<string, unknown>).text !== 'string')) {
+      throw new Error('MCP App model context only supports text content')
+    }
+    const structured = params.structuredContent
+    if (structured !== undefined
+      && (structured === null || typeof structured !== 'object' || Array.isArray(structured))) {
+      throw new Error('MCP App structured model context must be an object')
+    }
+    const parts = content.map(block => (block as { text: string }).text)
+    if (structured !== undefined) {
+      parts.push(`Structured context:\n${JSON.stringify(structured)}`)
+    }
+    const key = `${binding.item.viewId}\0${sessionId}\0${binding.item.connectionGeneration}`
+    const text = parts.filter(part => part !== '').join('\n\n')
+    if (text === '') {
+      this.modelContexts.delete(key)
+    } else {
+      this.modelContexts.set(key, {
+        viewId: binding.item.viewId,
+        sessionId,
+        connectionGeneration: binding.item.connectionGeneration,
+        text: `MCP App context from "${binding.item.publicToolName}":\n${text}`,
+      })
+    }
+  }
+
+  modelContext(sessionId: string | undefined): string {
+    if (sessionId === undefined) return ''
+    const text = [...this.modelContexts.values()]
+      .filter(context => context.sessionId === sessionId
+        && this.views.get(context.viewId)?.item.connectionGeneration === context.connectionGeneration)
+      .sort((left, right) => left.viewId.localeCompare(right.viewId))
+      .map(context => context.text)
+      .join('\n\n')
+    return text
   }
 
   async readView(viewId: unknown): Promise<McpAppView> {
@@ -529,13 +923,33 @@ class McpAppsHost {
     return { html, ...csp === undefined ? {} : { csp } }
   }
 
-  async callTool(viewId: unknown, name: unknown, args: unknown): Promise<CallToolResult> {
+  async callTool(
+    viewId: unknown,
+    name: unknown,
+    args: unknown,
+    sessionId: unknown,
+    connectionGeneration: unknown,
+  ): Promise<CallToolResult> {
     const binding = this.binding(viewId)
     if (typeof name !== 'string') throw new Error('tool name must be a string')
+    const hasOwner = sessionId !== undefined || connectionGeneration !== undefined
+    if (hasOwner && (typeof sessionId !== 'string' || sessionId === '')) {
+      throw new Error('Harness Session identity is required')
+    }
+    if (hasOwner && connectionGeneration !== binding.item.connectionGeneration) {
+      throw new Error('MCP Server connection generation changed')
+    }
     const listed = binding.state.tools.get(name)
     if (listed === undefined || !listed.visibility.app) throw new Error('tool is not visible to this MCP App')
     const input = typeof args === 'object' && args !== null ? args as Record<string, unknown> : {}
-    return binding.state.call(name, input)
+    return binding.state.call(
+      name,
+      input,
+      undefined,
+      hasOwner
+        ? { [DSH_SESSION_META_KEY]: { sessionId, connectionGeneration } }
+        : undefined,
+    )
   }
 
   async readResource(viewId: unknown, uri: unknown) {
@@ -602,7 +1016,28 @@ function apiHandler(host: McpAppsHost, maxBodyBytes: number) {
         return
       }
       if (path === `${API_PREFIX}/tool`) {
-        sendJson(res, 200, await host.callTool(body.viewId, body.name, body.arguments))
+        sendJson(res, 200, await host.callTool(
+          body.viewId,
+          body.name,
+          body.arguments,
+          body.sessionId,
+          body.connectionGeneration,
+        ))
+        return
+      }
+      if (path === `${API_PREFIX}/model-context`) {
+        host.updateModelContext(
+          body.viewId,
+          body.sessionId,
+          body.connectionGeneration,
+          {
+            ...body.content === undefined ? {} : { content: body.content },
+            ...body.structuredContent === undefined
+              ? {}
+              : { structuredContent: body.structuredContent },
+          },
+        )
+        sendJson(res, 200, {})
         return
       }
       if (path === `${API_PREFIX}/resource`) {
@@ -625,6 +1060,11 @@ export async function applyHost(ctx: Context, config?: Config): Promise<void> {
   await ctx.effect(async () => {
     const sandbox = await startSandboxServer()
     const host = new McpAppsHost(sandbox.origin, resolved.maxBodyBytes)
+    const disposeModelContext = ctx.systemPrompt.context({
+      name: 'mcp-apps:view-context',
+      order: 140,
+      text: context => host.modelContext(context.agent?.session.header.id),
+    })
     const disposeRoute = ctx.webServer.register({
       kind: 'prefix',
       path: API_PREFIX,
@@ -640,12 +1080,14 @@ export async function applyHost(ctx: Context, config?: Config): Promise<void> {
     } catch (error) {
       for (const state of states.reverse()) await state.dispose()
       disposeRoute()
+      disposeModelContext()
       await sandbox.close()
       throw error
     }
     return async () => {
       disposeRoute()
       for (const state of states.reverse()) await state.dispose()
+      disposeModelContext()
       await sandbox.close()
     }
   }, 'mcp-apps.host')
