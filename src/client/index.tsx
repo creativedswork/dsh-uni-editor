@@ -415,13 +415,13 @@ function McpAppRow({
         viewId,
         meta.resourceUri,
       ])
-  const runtime = useMemo(() => viewId === undefined
+  const runtime = useMemo(() => !ownsInstance || viewId === undefined
     ? undefined
     : persistentAppRuntime(
         runtimeKey,
         runtimeIdentity,
         `MCP App: ${descriptor.publicToolName}`,
-      ), [descriptor.publicToolName, retry, runtimeIdentity, runtimeKey, viewId])
+      ), [descriptor.publicToolName, ownsInstance, retry, runtimeIdentity, runtimeKey, viewId])
   if (meta !== undefined && settled !== undefined) {
     latestResultRef.current = meta.result as CallToolResult
     latestArgsRef.current = argsOf(settled)
