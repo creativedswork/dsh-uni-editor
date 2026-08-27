@@ -11,7 +11,10 @@ export interface FrameViewport {
 }
 
 export interface FrameClip {
-  clipPath: string
+  left: number
+  top: number
+  width: number
+  height: number
   visible: boolean
 }
 
@@ -111,7 +114,15 @@ export function computeInlineFrameClip(
   viewport: FrameViewport,
   occluder?: FrameRect,
 ): FrameClip {
-  if (scrollport === undefined) return { clipPath: 'none', visible: true }
+  if (scrollport === undefined) {
+    return {
+      left: bounds.left,
+      top: bounds.top,
+      width: bounds.right - bounds.left,
+      height: bounds.bottom - bounds.top,
+      visible: true,
+    }
+  }
   const left = Math.max(bounds.left, scrollport.left, 0)
   const top = Math.max(bounds.top, scrollport.top, 0)
   const right = Math.min(bounds.right, scrollport.right, viewport.width)
@@ -126,10 +137,13 @@ export function computeInlineFrameClip(
     overlapsOccluder ? occluder.top : Number.POSITIVE_INFINITY,
   )
   if (right <= left || bottom <= top) {
-    return { clipPath: 'inset(50%)', visible: false }
+    return { left, top, width: 0, height: 0, visible: false }
   }
   return {
-    clipPath: `inset(${String(top - bounds.top)}px ${String(bounds.right - right)}px ${String(bounds.bottom - bottom)}px ${String(left - bounds.left)}px)`,
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
     visible: true,
   }
 }

@@ -29,6 +29,7 @@ import {
   appRuntimeInteractionsSuspended,
   computeInlineFrameClip,
   observeFramePlacement,
+  type FrameClip,
 } from './frame-placement.js'
 import { currentViewId } from './view-binding.js'
 
@@ -220,6 +221,7 @@ function appHostContext(
 
 interface PersistentAppRuntime {
   identity: string
+  clip: HTMLDivElement
   iframe: HTMLIFrameElement
   bridge?: AppBridge
   ready: boolean
@@ -232,6 +234,7 @@ interface PersistentAppRuntime {
 
 const persistentAppRuntimes = new Map<string, PersistentAppRuntime>()
 let parkingRoot: HTMLElement | undefined
+
 
 function appParkingRoot(): HTMLElement {
   if (parkingRoot === undefined) {
@@ -251,18 +254,21 @@ function parkAppRuntime(runtime: PersistentAppRuntime): void {
   runtime.stopPlacementObservation?.()
   runtime.stopPlacementObservation = undefined
   runtime.host = undefined
-  Object.assign(runtime.iframe.style, {
+  Object.assign(runtime.clip.style, {
     left: '0',
     top: '0',
+    width: '1px',
+    height: '1px',
     opacity: '0',
     pointerEvents: 'none',
   })
+  runtime.iframe.style.pointerEvents = 'none'
 }
 
 function inlineAppRuntimeClip(
   host: HTMLElement,
   bounds: DOMRect,
-): { clipPath: string; visible: boolean } {
+): FrameClip {
   const scrollport = host.closest<HTMLElement>('[data-conversation-scroll]')
   const composer = scrollport?.querySelector<HTMLElement>('[data-composer-seat]')
   return computeInlineFrameClip(
@@ -281,18 +287,32 @@ function placeAppRuntime(runtime: PersistentAppRuntime): void {
   }
   const bounds = host.getBoundingClientRect()
   const placement = runtime.displayMode === 'fullscreen'
-    ? { clipPath: 'none', visible: true }
+    ? {
+        left: bounds.left,
+        top: bounds.top,
+        width: bounds.width,
+        height: bounds.height,
+        visible: true,
+      }
     : inlineAppRuntimeClip(host, bounds)
   const interactive = runtime.ready
     && placement.visible
     && !appRuntimeInteractionsSuspended()
+  Object.assign(runtime.clip.style, {
+    left: `${String(placement.left)}px`,
+    top: `${String(placement.top)}px`,
+    width: `${String(Math.max(1, placement.width))}px`,
+    height: `${String(Math.max(1, placement.height))}px`,
+    opacity: runtime.ready && placement.visible ? '1' : '0',
+    pointerEvents: 'none',
+  })
   Object.assign(runtime.iframe.style, {
-    left: `${String(bounds.left)}px`,
-    top: `${String(bounds.top)}px`,
+    left: `${String(bounds.left - placement.left)}px`,
+    top: `${String(bounds.top - placement.top)}px`,
     width: `${String(Math.max(1, bounds.width))}px`,
     height: `${String(Math.max(1, bounds.height))}px`,
-    clipPath: placement.clipPath,
-    opacity: runtime.ready && placement.visible ? '1' : '0',
+    clipPath: 'none',
+    opacity: '1',
     pointerEvents: interactive ? 'auto' : 'none',
   })
 }
@@ -304,7 +324,7 @@ function disposeAppRuntime(runtime: PersistentAppRuntime): void {
   runtime.stopPlacementObservation?.()
   runtime.stopPlacementObservation = undefined
   runtime.host = undefined
-  runtime.iframe.remove()
+  runtime.clip.remove()
   if (bridge !== undefined) {
     void timeout(bridge.teardownResource({}), 1_000, 'MCP App teardown timed out')
       .catch(() => {})
@@ -329,20 +349,33 @@ function persistentAppRuntime(
   const current = persistentAppRuntimes.get(key)
   if (current?.identity === identity) return current
   if (current !== undefined) disposeAppRuntime(current)
+  const clip = document.createElement('div')
+  Object.assign(clip.style, {
+    position: 'fixed',
+    left: '0',
+    top: '0',
+    width: '1px',
+    height: '1px',
+    overflow: 'hidden',
+    opacity: '0',
+    pointerEvents: 'none',
+  })
   const iframe = document.createElement('iframe')
   iframe.title = title
-  iframe.style.position = 'fixed'
+  iframe.style.position = 'absolute'
   iframe.style.left = '0'
   iframe.style.top = '0'
   iframe.style.width = '1px'
   iframe.style.height = '320px'
   iframe.style.border = '0'
   iframe.style.background = 'transparent'
-  iframe.style.opacity = '0'
+  iframe.style.opacity = '1'
   iframe.style.pointerEvents = 'none'
-  appParkingRoot().appendChild(iframe)
+  clip.appendChild(iframe)
+  appParkingRoot().appendChild(clip)
   const runtime: PersistentAppRuntime = {
     identity,
+    clip,
     iframe,
     ready: false,
     displayMode: 'inline',
@@ -441,7 +474,9 @@ function McpAppRow({
       runtime?.bridge?.sendToolInput({ arguments: args })
       runtime?.bridge?.sendToolResult(result as CallToolResult)
     },
-    setOwner: owner => { setOwnsInstance(owner) },
+    setOwner: owner => {
+      setOwnsInstance(owner)
+    },
     requestSurface: surface => { requestSurfaceRef.current(surface) },
     locate: () => { locateRef.current() },
   }), [callId, descriptor.publicToolName, instanceId, runtime, sessionKey])

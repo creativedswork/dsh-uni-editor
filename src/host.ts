@@ -942,7 +942,7 @@ class McpAppsHost {
     const listed = binding.state.tools.get(name)
     if (listed === undefined || !listed.visibility.app) throw new Error('tool is not visible to this MCP App')
     const input = typeof args === 'object' && args !== null ? args as Record<string, unknown> : {}
-    return binding.state.call(
+    const result = await binding.state.call(
       name,
       input,
       undefined,
@@ -950,6 +950,14 @@ class McpAppsHost {
         ? { [DSH_SESSION_META_KEY]: { sessionId, connectionGeneration } }
         : undefined,
     )
+    if (hasOwner) {
+      this.bindViewSession(
+        binding.item.viewId,
+        sessionId as string,
+        connectionGeneration as string,
+      )
+    }
+    return result
   }
 
   async readResource(viewId: unknown, uri: unknown) {

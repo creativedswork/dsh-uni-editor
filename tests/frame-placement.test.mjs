@@ -17,7 +17,10 @@ test('clips a fixed App frame at the conversation scrollport', () => {
       viewport,
     ),
     {
-      clipPath: 'inset(294px 0px 0px 50px)',
+      left: 350,
+      top: 94,
+      width: 850,
+      height: 506,
       visible: true,
     },
   )
@@ -31,7 +34,10 @@ test('disables hit testing when a fixed App frame is outside the scrollport', ()
       viewport,
     ),
     {
-      clipPath: 'inset(50%)',
+      left: 350,
+      top: 94,
+      width: 0,
+      height: 0,
       visible: false,
     },
   )
@@ -45,7 +51,10 @@ test('leaves an inline App frame uncut without a scrollport', () => {
       viewport,
     ),
     {
-      clipPath: 'none',
+      left: 300,
+      top: 100,
+      width: 900,
+      height: 700,
       visible: true,
     },
   )
@@ -60,7 +69,10 @@ test('clips an inline App frame above the sticky composer', () => {
       { left: 280, top: 800, right: 1432, bottom: 1000 },
     ),
     {
-      clipPath: 'inset(0px 0px 150px 0px)',
+      left: 300,
+      top: 100,
+      width: 900,
+      height: 700,
       visible: true,
     },
   )
@@ -75,7 +87,10 @@ test('disables hit testing when the sticky composer fully covers an inline App f
       { left: 280, top: 800, right: 1432, bottom: 1000 },
     ),
     {
-      clipPath: 'inset(50%)',
+      left: 300,
+      top: 850,
+      width: 0,
+      height: 0,
       visible: false,
     },
   )
@@ -90,7 +105,10 @@ test('ignores an occluder outside the inline App frame', () => {
       { left: 280, top: 800, right: 1432, bottom: 1000 },
     ),
     {
-      clipPath: 'inset(0px 0px 0px 0px)',
+      left: 300,
+      top: 100,
+      width: 900,
+      height: 600,
       visible: true,
     },
   )

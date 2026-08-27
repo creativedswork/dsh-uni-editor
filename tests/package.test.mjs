@@ -6,6 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 
 const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
 const plugin = await import('../lib/index.js')
+const hostSource = await readFile(new URL('../src/host.ts', import.meta.url), 'utf8')
 
 function provideSystemPrompt(ctx, contexts = new Map()) {
   ctx.provide('systemPrompt', {
@@ -46,6 +47,17 @@ test('publishes one installable DSH bundle', async () => {
   assert.match(client, /Locate in Chat/)
   assert.match(client, /data-mcp-app-header-action/)
   assert.match(client, /data-mcp-app-definition-error/)
+})
+
+test('rebinds a restored App view after its first successful tool call', () => {
+  const callTool = hostSource.slice(
+    hostSource.indexOf('async callTool('),
+    hostSource.indexOf('async readResource(', hostSource.indexOf('async callTool(')),
+  )
+  const call = callTool.indexOf('await binding.state.call(')
+  const bind = callTool.indexOf('this.bindViewSession(')
+  assert.ok(call >= 0)
+  assert.ok(bind > call)
 })
 
 test('rejects CSP injection and normalizes safe origins', () => {
