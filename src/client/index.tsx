@@ -172,26 +172,53 @@ function textPrompt(params: AppMessageParams): Array<{ type: 'text'; text: strin
 }
 
 function downloadEmbedded(params: AppDownloadParams): AppDownloadResult {
-  if (params.contents.length !== 1) return { isError: true }
-  const content = params.contents[0]
-  if (content?.type !== 'resource' || !('text' in content.resource)) return { isError: true }
-  const resource = content.resource
-  const uri = new URL(resource.uri)
-  const filename = decodeURIComponent(uri.pathname.split('/').pop() ?? '')
-  if (uri.protocol !== 'file:'
-    || resource.mimeType !== 'application/json'
-    || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(filename)) {
+  try {
+    if (params.contents.length !== 1) return { isError: true }
+    const content = params.contents[0]
+    if (content?.type !== 'resource') return { isError: true }
+    const resource = content.resource
+    const uri = new URL(resource.uri)
+    const filename = decodeURIComponent(uri.pathname.split('/').pop() ?? '')
+    const extension = filename.slice(filename.lastIndexOf('.')).toLowerCase()
+    const expectedMimeType = new Map([
+      ['.excalidraw', 'application/json'],
+      ['.json', 'application/json'],
+      ['.svg', 'image/svg+xml'],
+      ['.png', 'image/png'],
+    ]).get(extension)
+    if (uri.protocol !== 'file:'
+      || resource.mimeType !== expectedMimeType
+      || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(filename)) {
+      return { isError: true }
+    }
+    let blob: Blob
+    if ('text' in resource && resource.mimeType !== 'image/png') {
+      blob = new Blob([resource.text], { type: resource.mimeType })
+    } else if ('blob' in resource && resource.mimeType === 'image/png') {
+      if (resource.blob.length > Math.ceil(MAX_DOWNLOAD_BYTES * 4 / 3) + 4) {
+        return { isError: true }
+      }
+      const binary = atob(resource.blob)
+      blob = new Blob([
+        Uint8Array.from(binary, byte => byte.charCodeAt(0)),
+      ], { type: resource.mimeType })
+    } else {
+      return { isError: true }
+    }
+    if (blob.size > MAX_DOWNLOAD_BYTES) return { isError: true }
+    const href = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = href
+    anchor.download = filename
+    anchor.hidden = true
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(href), 0)
+    return {}
+  } catch {
     return { isError: true }
   }
-  const blob = new Blob([resource.text], { type: resource.mimeType })
-  if (blob.size > MAX_DOWNLOAD_BYTES) return { isError: true }
-  const href = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = href
-  anchor.download = filename
-  anchor.click()
-  window.setTimeout(() => URL.revokeObjectURL(href), 0)
-  return {}
 }
 
 function appHostContext(
