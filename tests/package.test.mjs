@@ -6,6 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 
 const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
 const plugin = await import('../lib/index.js')
+const clientSource = await readFile(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
 const hostSource = await readFile(new URL('../src/host.ts', import.meta.url), 'utf8')
 
 function provideSystemPrompt(ctx, contexts = new Map()) {
@@ -58,6 +59,16 @@ test('rebinds a restored App view after its first successful tool call', () => {
   const bind = callTool.indexOf('this.bindViewSession(')
   assert.ok(call >= 0)
   assert.ok(bind > call)
+})
+
+test('keeps the App registry controller stable across ownership changes', () => {
+  const controller = clientSource.slice(
+    clientSource.indexOf('const controller = useMemo<AppInstanceController>'),
+    clientSource.indexOf('controller.surface =', clientSource.indexOf('const controller = useMemo<AppInstanceController>')),
+  )
+  assert.match(controller, /bridgeRef\.current/)
+  assert.doesNotMatch(controller, /runtime\?\./)
+  assert.doesNotMatch(controller, /\], \[[^\]]*\bruntime\b[^\]]*\]\)/)
 })
 
 test('rejects CSP injection and normalizes safe origins', () => {

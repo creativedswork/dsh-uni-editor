@@ -498,15 +498,15 @@ function McpAppRow({
     acceptResult: (result, args) => {
       latestResultRef.current = result as CallToolResult
       latestArgsRef.current = args
-      runtime?.bridge?.sendToolInput({ arguments: args })
-      runtime?.bridge?.sendToolResult(result as CallToolResult)
+      bridgeRef.current?.sendToolInput({ arguments: args })
+      bridgeRef.current?.sendToolResult(result as CallToolResult)
     },
     setOwner: owner => {
       setOwnsInstance(owner)
     },
     requestSurface: surface => { requestSurfaceRef.current(surface) },
     locate: () => { locateRef.current() },
-  }), [callId, descriptor.publicToolName, instanceId, runtime, sessionKey])
+  }), [callId, descriptor.publicToolName, instanceId, sessionKey])
   controller.surface = runtime?.displayMode ?? 'inline'
   controller.result = latestResultRef.current
   controller.args = latestArgsRef.current
