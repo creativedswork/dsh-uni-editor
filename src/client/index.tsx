@@ -729,7 +729,7 @@ function McpAppRow({
 
       bridge = new AppBridge(
         null,
-        { name: 'DSH Uni Editor', version: '0.3.1' },
+        { name: 'DSH Uni Editor', version: '0.3.2' },
         {
           serverTools: {},
           serverResources: {},
