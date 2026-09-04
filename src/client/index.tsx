@@ -899,6 +899,7 @@ function McpAppRow({
         {!ready && <div data-mcp-app-status="loading">Loading MCP App...</div>}
         {fullscreen && (
           <div
+            key="fullscreen-actions"
             data-mcp-app-fullscreen-actions
             style={{
               display: 'flex',
@@ -944,6 +945,7 @@ function McpAppRow({
           </div>
         )}
         <div
+          key="frame-host"
           ref={iframeHostRef}
           data-mcp-app-frame-host
           style={{
