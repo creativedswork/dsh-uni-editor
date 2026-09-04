@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   AppBridge,
   PostMessageTransport,
@@ -572,6 +572,13 @@ function McpAppRow({
       locateTimerRef.current = window.setTimeout(() => { setLocated(false) }, 1_800)
     })
   }
+
+  useLayoutEffect(() => {
+    const host = iframeHostRef.current
+    if (runtime === undefined || host === null) return
+    runtime.host = host
+    placeAppRuntime(runtime)
+  }, [displayMode, runtime])
 
   useEffect(() => {
     if (!hasAppResult) return
