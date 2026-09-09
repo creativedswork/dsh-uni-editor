@@ -312,6 +312,15 @@ function placeAppRuntime(runtime: PersistentAppRuntime): void {
     parkAppRuntime(runtime)
     return
   }
+  if (runtime.displayMode === 'inline'
+    && [...persistentAppRuntimes.values()].some(candidate => candidate.displayMode === 'fullscreen')) {
+    Object.assign(runtime.clip.style, {
+      opacity: '0',
+      pointerEvents: 'none',
+    })
+    runtime.iframe.style.pointerEvents = 'none'
+    return
+  }
   const bounds = host.getBoundingClientRect()
   const placement = runtime.displayMode === 'fullscreen'
     ? {
@@ -535,7 +544,7 @@ function McpAppRow({
     setDisplayMode(surface)
     if (iframe !== undefined) {
       window.requestAnimationFrame(() => {
-        if (runtime !== undefined) placeAppRuntime(runtime)
+        for (const current of persistentAppRuntimes.values()) placeAppRuntime(current)
       })
       bridgeRef.current?.setHostContext(appHostContext(iframe, surface, rootRef.current))
     }
