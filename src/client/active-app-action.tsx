@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -40,10 +41,10 @@ const buttonStyle: CSSProperties = {
 }
 
 const menuStyle: CSSProperties = {
-  position: 'absolute',
-  top: 'calc(100% + 5px)',
+  position: 'fixed',
+  inset: 'auto',
+  top: 0,
   left: 0,
-  zIndex: 100,
   display: 'flex',
   flexDirection: 'column',
   gap: 4,
@@ -87,6 +88,7 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
   const id = String(sessionId)
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)
   const subscribe = useCallback((listener: () => void) => appRegistry.subscribe(id, listener), [id])
   const getSnapshot = useCallback(() => appRegistry.snapshot(id), [id])
@@ -114,6 +116,23 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
   useEffect(() => {
     if (instances.length === 0) setOpen(false)
   }, [instances.length])
+
+  useLayoutEffect(() => {
+    if (!open || rootRef.current === null || menuRef.current === null) return
+    const menu = menuRef.current
+    const anchor = rootRef.current.getBoundingClientRect()
+    menu.setAttribute('popover', 'manual')
+    menu.style.top = `${String(anchor.bottom + 5)}px`
+    menu.showPopover()
+    const width = menu.getBoundingClientRect().width
+    menu.style.left = `${String(Math.max(16, Math.min(
+      anchor.left,
+      window.innerWidth - width - 16,
+    )))}px`
+    return () => {
+      if (menu.matches(':popover-open')) menu.hidePopover()
+    }
+  }, [open])
 
   if (active === undefined) return null
 
@@ -180,7 +199,12 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
         />
       </button>
       {open && (
-        <div role="menu" aria-label="MCP Apps" style={menuStyle}>
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="MCP Apps"
+          style={menuStyle}
+        >
           {instances.map(instance => {
             const isActive = instance.callId === active.callId
             return (
