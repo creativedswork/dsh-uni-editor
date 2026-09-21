@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,7 +11,10 @@ import type { CSSProperties, KeyboardEvent } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { appRegistry } from './app-registry.js'
-import { suspendAppRuntimeInteractions } from './frame-placement.js'
+import {
+  observeFramePlacement,
+  suspendAppRuntimeInteractions,
+} from './frame-placement.js'
 
 type ActiveAppActionProps = PropsRuntime<'conversation.session.header.actions'>
 
@@ -40,10 +44,10 @@ const buttonStyle: CSSProperties = {
 }
 
 const menuStyle: CSSProperties = {
-  position: 'absolute',
-  top: 'calc(100% + 5px)',
+  position: 'fixed',
+  inset: 'auto',
+  top: 0,
   left: 0,
-  zIndex: 100,
   display: 'flex',
   flexDirection: 'column',
   gap: 4,
@@ -87,6 +91,7 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
   const id = String(sessionId)
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)
   const subscribe = useCallback((listener: () => void) => appRegistry.subscribe(id, listener), [id])
   const getSnapshot = useCallback(() => appRegistry.snapshot(id), [id])
@@ -114,6 +119,55 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
   useEffect(() => {
     if (instances.length === 0) setOpen(false)
   }, [instances.length])
+
+  useLayoutEffect(() => {
+    if (!open || rootRef.current === null || menuRef.current === null) return
+    const menu = menuRef.current
+    const anchorElement = rootRef.current
+    menu.setAttribute('popover', 'manual')
+    menu.showPopover()
+    const position = (): void => {
+      const anchor = anchorElement.getBoundingClientRect()
+      const viewport = window.visualViewport
+      const viewportLeft = viewport?.offsetLeft ?? 0
+      const viewportTop = viewport?.offsetTop ?? 0
+      const viewportWidth = viewport?.width ?? window.innerWidth
+      const viewportHeight = viewport?.height ?? window.innerHeight
+      menu.style.maxWidth = `${String(Math.max(1, viewportWidth - 32))}px`
+      menu.style.maxHeight = `${String(Math.max(1, viewportHeight - 32))}px`
+      const bounds = menu.getBoundingClientRect()
+      const below = anchor.bottom + 5
+      const above = anchor.top - bounds.height - 5
+      const minLeft = viewportLeft + 16
+      const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - bounds.width - 16)
+      menu.style.top = `${String(
+        below + bounds.height <= viewportTop + viewportHeight - 16
+          ? below
+          : Math.max(viewportTop + 16, above),
+      )}px`
+      menu.style.left = `${String(Math.max(minLeft, Math.min(anchor.left, maxLeft)))}px`
+    }
+    position()
+    const stopPlacementObservation = observeFramePlacement(() => {
+      const { left, top, right, bottom } = anchorElement.getBoundingClientRect()
+      return { left, top, right, bottom }
+    }, position)
+    const observer = new ResizeObserver(position)
+    observer.observe(menu)
+    window.addEventListener('resize', position)
+    window.visualViewport?.addEventListener('resize', position)
+    window.visualViewport?.addEventListener('scroll', position)
+    document.addEventListener('scroll', position, true)
+    return () => {
+      stopPlacementObservation()
+      observer.disconnect()
+      window.removeEventListener('resize', position)
+      window.visualViewport?.removeEventListener('resize', position)
+      window.visualViewport?.removeEventListener('scroll', position)
+      document.removeEventListener('scroll', position, true)
+      if (menu.matches(':popover-open')) menu.hidePopover()
+    }
+  }, [open])
 
   if (active === undefined) return null
 
@@ -180,7 +234,12 @@ export function ActiveAppAction({ sessionId }: ActiveAppActionProps) {
         />
       </button>
       {open && (
-        <div role="menu" aria-label="MCP Apps" style={menuStyle}>
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="MCP Apps"
+          style={menuStyle}
+        >
           {instances.map(instance => {
             const isActive = instance.callId === active.callId
             return (

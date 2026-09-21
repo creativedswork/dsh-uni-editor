@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { currentViewId } from '../src/client/view-binding.ts'
+import { appInstanceId, currentViewId } from '../src/client/view-binding.ts'
 
 const meta = {
   kind: 'dsh/mcp-app',
@@ -27,4 +27,23 @@ test('rejects a changed App definition', () => {
     resourceUri: 'ui://other/app',
     sandboxOrigin: 'http://127.0.0.1:1234',
   }), /definition no longer matches/)
+})
+
+test('deduplicates repeated canvas results without merging different canvases', () => {
+  const canvasMeta = canvasPath => ({
+    ...meta,
+    result: {
+      content: [],
+      structuredContent: { canvasPath },
+    },
+  })
+
+  assert.equal(
+    appInstanceId(canvasMeta('designs/demo/main.excalidraw'), 'excalidraw', 'call-1'),
+    appInstanceId(canvasMeta('designs/demo/main.excalidraw'), 'excalidraw', 'call-2'),
+  )
+  assert.notEqual(
+    appInstanceId(canvasMeta('designs/demo/main.excalidraw'), 'excalidraw', 'call-1'),
+    appInstanceId(canvasMeta('designs/demo/other.excalidraw'), 'excalidraw', 'call-2'),
+  )
 })

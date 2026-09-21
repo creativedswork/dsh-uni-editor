@@ -31,7 +31,7 @@ import {
   observeFramePlacement,
   type FrameClip,
 } from './frame-placement.js'
-import { currentViewId } from './view-binding.js'
+import { appInstanceId, currentViewId } from './view-binding.js'
 
 const API_PREFIX = '/api/mcp-apps'
 const CATALOG_REFRESH_MS = 5_000
@@ -454,9 +454,8 @@ function McpAppRow({
   const settled: ToolResultNode | undefined = 'kind' in block ? block : undefined
   const meta = presentationMeta(settled?.meta)
   const sessionKey = String(sessionId)
-  const instanceId = meta?.projectId === undefined
-    ? `${descriptor.serverName}:call:${callId}`
-    : `${descriptor.serverName}:project:${meta.projectId}`
+  const instanceId = appInstanceId(meta, descriptor.serverName, callId)
+  const persistentInstance = instanceId !== `${descriptor.serverName}:call:${callId}`
   const runtimeKey = `${sessionKey}\0${instanceId}`
   let viewId: string | undefined
   let bindingError: string | undefined
@@ -802,7 +801,7 @@ function McpAppRow({
       if (runtime.host === host) {
         parkAppRuntime(runtime)
       }
-      if (meta.projectId === undefined || !runtime.ready) {
+      if (!persistentInstance || !runtime.ready) {
         if (persistentAppRuntimes.get(runtimeKey) === runtime) {
           persistentAppRuntimes.delete(runtimeKey)
           disposeAppRuntime(runtime)
@@ -817,6 +816,7 @@ function McpAppRow({
     descriptor.sandboxOrigin,
     hasAppResult,
     ownsInstance,
+    persistentInstance,
     retry,
     runtime,
     runtimeKey,
