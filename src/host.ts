@@ -392,7 +392,7 @@ class ServerState {
 
   private createClient(): Client {
     const client = new Client(
-      { name: 'dsh-uni-editor', version: '0.3.2' },
+      { name: 'dsh-uni-editor', version: '0.3.3' },
       {
         capabilities: {
           extensions: {

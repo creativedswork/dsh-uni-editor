@@ -1,6 +1,6 @@
 {
   "name": "@creative-dswork/dsh-uni-editor",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Unified Editor runtime for DeepSeek Harness, powered by MCP Apps",
   "keywords": [
     "deepseek",
